@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+data/
+notebooks/
+
+# Model weights (too large for GitHub -- host on HuggingFace Hub instead)
+*.safetensors
+*.pkl
+models/roberta-hc3/
