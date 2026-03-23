@@ -111,9 +111,9 @@ Where **label 0 = human** and **label 1 = AI-generated**.
 
 | Split      | Proportion | Strategy                      |
 | ---------- | ---------- | ----------------------------- |
-| Train      | 70%        | Stratified by (domain, label) |
-| Validation | 15%        | Stratified by (domain, label) |
-| Test       | 15%        | Stratified by (domain, label) |
+| Train      | 70%        | Stratified by domain |
+| Validation | 15%        | Stratified by domain |
+| Test       | 15%        | Stratified by domain |
 
 
 Stratification ensures each split preserves the per-domain class distribution. Splitting is done at the **question level** -- all answers derived from the same question land in the same split to prevent data leakage.
@@ -146,11 +146,11 @@ We adopt a three-tier approach, progressing from a simple baseline to the primar
 
 **Advantages**: Fast to train (~minutes), fully interpretable via feature coefficients, no GPU required.
 
-### Tier 2: Fine-Tuned RoBERTa (Primary Approach)
+### Tier 2: Fine-Tuned DistilRoBERTa (Primary Approach)
 
 **Purpose**: The main production-quality model. RoBERTa-based classifiers have been shown to achieve **98% F1** on the HC3 dataset.
 
-**Base Model**: `[roberta-base](https://huggingface.co/roberta-base)` (125M parameters)
+**Base Model**: [`distilroberta-base`](https://huggingface.co/distilroberta-base) (~82M parameters, 6 transformer layers)
 
 **Architecture**:
 
@@ -158,22 +158,22 @@ We adopt a three-tier approach, progressing from a simple baseline to the primar
 Input Text
     |
     v
-[RoBERTa Tokenizer] --> input_ids, attention_mask
+[DistilRoBERTa Tokenizer] --> input_ids, attention_mask
     |
     v
-[RoBERTa Encoder]   --> hidden states (768-dim per token)
+[DistilRoBERTa Encoder]   --> hidden states (768-dim per token)
     |
     v
-[CLS Token Pooling]  --> 768-dim vector
+[CLS Token Pooling]        --> 768-dim vector
     |
     v
 [Dropout (p=0.1)]
     |
     v
-[Linear Layer]       --> 2 logits (human vs. AI)
+[Linear Layer]              --> 2 logits (human vs. AI)
     |
     v
-[Softmax / Argmax]   --> prediction
+[Softmax / Argmax]          --> prediction
 ```
 
 **Key Design Decisions**:
@@ -181,7 +181,7 @@ Input Text
 
 | Decision            | Choice                               | Rationale                                                        |
 | ------------------- | ------------------------------------ | ---------------------------------------------------------------- |
-| Base model          | `roberta-base`                       | Proven on HC3; good balance of size and quality                  |
+| Base model          | `distilroberta-base`                 | Distilled RoBERTa; faster training with comparable quality       |
 | Input format        | Answer text only (question optional) | Single-text detection is more general; QA-pair mode is a variant |
 | Max sequence length | 512 tokens                           | RoBERTa's native limit; longer answers are truncated             |
 | Classification head | Single linear layer on `[CLS]`       | Sufficient for binary classification; avoids overfitting         |
@@ -194,7 +194,7 @@ Input Text
 | Parameter     | Value                     | Notes                                       |
 | ------------- | ------------------------- | ------------------------------------------- |
 | Learning rate | 2e-5                      | Standard for fine-tuning transformers       |
-| Batch size    | 16 or 32                  | Depends on available GPU memory             |
+| Batch size    | 16 (effective 64)         | Gradient accumulation with 4 steps          |
 | Epochs        | 3-5                       | Early stopping monitors validation loss     |
 | Warmup ratio  | 0.1                       | 10% of training steps use linear warmup     |
 | Weight decay  | 0.01                      | Applied to all params except bias/LayerNorm |
@@ -204,7 +204,7 @@ Input Text
 
 **Variant -- QA-Pair Mode**: Concatenate `[CLS] question [SEP] answer [SEP]` as input. This gives the model access to the question context, potentially improving accuracy when the answer's plausibility depends on the question.
 
-### Tier 3: Advanced Extensions (Optional)
+### Tier 3: Advanced Extensions (Future Research Direction, not yet implemented)
 
 These are stretch goals for improved robustness:
 
@@ -227,12 +227,16 @@ Combine Tier 1 (TF-IDF + LR) predictions with Tier 2 (RoBERTa) predictions via a
 ### 4.1 Loading
 
 ```python
-from datasets import load_dataset
+from huggingface_hub import hf_hub_download
 
-dataset = load_dataset("Hello-SimpleAI/HC3", "all", split="train")
+local_path = hf_hub_download(
+    repo_id="Hello-SimpleAI/HC3",
+    filename="all.jsonl",
+    repo_type="dataset",
+)
 ```
 
-This downloads `all.jsonl` (~73.7 MB) and loads it into a HuggingFace `Dataset` object.
+This downloads `all.jsonl` (~73.7 MB) directly from the HuggingFace Hub. We use `hf_hub_download` instead of `datasets.load_dataset` because HC3's custom dataset script is no longer supported by newer versions of the `datasets` library.
 
 ### 4.2 Flattening
 
@@ -266,7 +270,7 @@ def flatten_hc3(dataset):
 ```python
 from sklearn.model_selection import train_test_split
 
-questions = df[["question", "source", "label"]].drop_duplicates(subset="question")
+questions = df[["question", "source"]].drop_duplicates(subset="question")
 
 train_q, temp_q = train_test_split(
     questions, test_size=0.30, stratify=questions["source"], random_state=42
@@ -285,7 +289,7 @@ test_df  = df[df["question"].isin(test_q["question"])]
 ```python
 from transformers import AutoTokenizer
 
-tokenizer = AutoTokenizer.from_pretrained("roberta-base")
+tokenizer = AutoTokenizer.from_pretrained("distilroberta-base")
 
 def tokenize_fn(batch):
     return tokenizer(
@@ -323,10 +327,11 @@ from transformers import (
     AutoModelForSequenceClassification,
     TrainingArguments,
     Trainer,
+    EarlyStoppingCallback,
 )
 
 model = AutoModelForSequenceClassification.from_pretrained(
-    "roberta-base", num_labels=2
+    "distilroberta-base", num_labels=2
 )
 
 training_args = TrainingArguments(
@@ -336,13 +341,15 @@ training_args = TrainingArguments(
     learning_rate=2e-5,
     per_device_train_batch_size=16,
     per_device_eval_batch_size=32,
+    gradient_accumulation_steps=4,
     num_train_epochs=5,
     weight_decay=0.01,
-    warmup_ratio=0.1,
+    warmup_steps=warmup_steps,       # computed from 10% of total steps
     load_best_model_at_end=True,
     metric_for_best_model="f1",
-    fp16=True,
-    logging_steps=100,
+    greater_is_better=True,
+    fp16=False,                       # disabled for GPUs without Tensor Cores
+    logging_steps=20,
     report_to="none",
 )
 
@@ -351,8 +358,9 @@ trainer = Trainer(
     args=training_args,
     train_dataset=train_dataset,
     eval_dataset=val_dataset,
-    tokenizer=tokenizer,
+    processing_class=tokenizer,
     compute_metrics=compute_metrics,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
 )
 
 trainer.train()
@@ -392,7 +400,7 @@ for epoch in range(num_epochs):
 
 ### 5.3 Early Stopping
 
-Monitor validation loss at each epoch. Stop training if validation loss does not improve for 2 consecutive epochs. Restore the best checkpoint.
+Monitor validation F1 at each epoch. Stop training if validation F1 does not improve for 2 consecutive epochs. Restore the best checkpoint.
 
 ### 5.4 Checkpointing
 
@@ -466,22 +474,24 @@ The HC3 dataset only contains ChatGPT-generated text. A model trained solely on 
 
 ```
 MSE_446/
-├── architecture.md              # This design document
+├── README.md                    # This design document
 ├── requirements.txt             # Python dependencies with pinned versions
-├── data/
+├── data/                        # Populated after running data_preprocessing.py
 │   ├── raw/                     # Downloaded JSONL files from HC3
 │   └── processed/               # Train/val/test CSV splits after flattening
 ├── src/
+│   ├── __init__.py
 │   ├── data_preprocessing.py    # Download, flatten, and split the dataset
 │   ├── dataset.py               # PyTorch Dataset / HF Dataset wrappers
-│   ├── model.py                 # Model definition (RoBERTa + classification head)
+│   ├── model.py                 # Model definition (DistilRoBERTa + classification head)
 │   ├── train.py                 # Training loop / Trainer configuration
 │   ├── evaluate.py              # Evaluation metrics and visualization
 │   └── utils.py                 # Shared helpers (logging, config, seeding)
-├── notebooks/
-│   └── eda.ipynb                # Exploratory data analysis
+├── tests/
+│   ├── __init__.py
+│   └── test_pipeline.py         # Smoke tests for end-to-end pipeline
 ├── models/                      # Saved model checkpoints
-└── results/                     # Evaluation metrics, plots, confusion matrices
+├── results/                     # Evaluation metrics, plots, confusion matrices
 ```
 
 ### File Responsibilities
@@ -489,9 +499,9 @@ MSE_446/
 
 | File                    | Responsibility                                                                                                                                      |
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `data_preprocessing.py` | Loads HC3 via HuggingFace `datasets`, flattens answers, performs question-level stratified splits, saves to `data/processed/`.                      |
+| `data_preprocessing.py` | Downloads HC3 via `huggingface_hub`, flattens answers, performs question-level stratified splits, saves to `data/processed/`.                        |
 | `dataset.py`            | Wraps processed CSVs into tokenized PyTorch datasets with `__getitem__` returning `input_ids`, `attention_mask`, and `label`.                       |
-| `model.py`              | Defines the classifier. For Tier 2, this is a thin wrapper around `AutoModelForSequenceClassification`. For Tier 1, it houses the sklearn pipeline. |
+| `model.py`              | Defines the classifier. For Tier 2, wraps `AutoModelForSequenceClassification` with DistilRoBERTa. For Tier 1, houses the sklearn pipeline.         |
 | `train.py`              | Entry point for training. Parses CLI args, initializes model/data/optimizer, runs training with early stopping, saves best checkpoint.              |
 | `evaluate.py`           | Loads a trained model, runs inference on test set, computes all metrics, generates per-domain breakdown and confusion matrix plots.                 |
 | `utils.py`              | Seed setting, device selection, logging configuration, config dataclasses.                                                                          |
@@ -519,15 +529,15 @@ tqdm>=4.65
 ### Hardware Requirements
 
 
-| Component | Minimum                   | Recommended                    |
-| --------- | ------------------------- | ------------------------------ |
-| GPU       | NVIDIA GPU with 8 GB VRAM | NVIDIA A100 / RTX 3090 (24 GB) |
-| RAM       | 16 GB                     | 32 GB                          |
-| Disk      | 5 GB free                 | 20 GB free (for checkpoints)   |
-| Python    | 3.10+                     | 3.11                           |
+| Component | Minimum                   | Tested On                         |
+| --------- | ------------------------- | --------------------------------- |
+| GPU       | NVIDIA GPU with 8 GB VRAM | NVIDIA Tesla P4 (8 GB, CUDA 11.8) |
+| RAM       | 16 GB                     | 32 GB                             |
+| Disk      | 5 GB free                 | 20 GB free (for checkpoints)      |
+| Python    | 3.10+                     | 3.12                              |
 
 
-Tier 1 (TF-IDF + LR) can run on CPU only. Tier 2 (RoBERTa fine-tuning) requires a GPU for practical training times (~30-60 min on a single A100 with fp16).
+Tier 1 (TF-IDF + LR) can run on CPU only. Tier 2 (DistilRoBERTa fine-tuning) requires a GPU for practical training times. Training was completed on a Tesla P4 in FP32 mode (FP16 disabled due to lack of Tensor Cores on Pascal-architecture GPUs).
 
 ---
 
@@ -547,12 +557,12 @@ flowchart LR
     end
 
     subgraph tokenization [Tokenization]
-        Tok["RoBERTa Tokenizer<br/>max_length=512"]
+        Tok["DistilRoBERTa Tokenizer<br/>max_length=512"]
         Collator["DataCollatorWithPadding<br/>dynamic batching"]
     end
 
     subgraph model [Model]
-        Encoder["RoBERTa Encoder<br/>12 layers, 768-dim"]
+        Encoder["DistilRoBERTa Encoder<br/>6 layers, 768-dim"]
         CLS["CLS Pooling"]
         Head["Linear Head<br/>768 -> 2"]
     end
@@ -567,19 +577,19 @@ flowchart LR
 
 
 
-### 9.2 Model Architecture (Tier 2 -- RoBERTa Classifier)
+### 9.2 Model Architecture (Tier 2 -- DistilRoBERTa Classifier)
 
 ```mermaid
 flowchart TB
     Input["Input Text<br/>'The economy is influenced by...'"]
-    Tokenizer["RoBERTa Tokenizer<br/>input_ids + attention_mask"]
+    Tokenizer["DistilRoBERTa Tokenizer<br/>input_ids + attention_mask"]
     
-    subgraph encoder [RoBERTa Encoder]
+    subgraph encoder [DistilRoBERTa Encoder]
         Emb["Token + Position Embeddings"]
         L1["Transformer Layer 1"]
         L2["Transformer Layer 2"]
         Ldots["..."]
-        L12["Transformer Layer 12"]
+        L6["Transformer Layer 6"]
     end
 
     CLS["CLS Token Output<br/>768-dim vector"]
@@ -588,7 +598,7 @@ flowchart TB
     Softmax["Softmax"]
     Out["P(human)=0.03  P(AI)=0.97"]
 
-    Input --> Tokenizer --> Emb --> L1 --> L2 --> Ldots --> L12 --> CLS --> Drop --> Linear --> Softmax --> Out
+    Input --> Tokenizer --> Emb --> L1 --> L2 --> Ldots --> L6 --> CLS --> Drop --> Linear --> Softmax --> Out
 ```
 
 
@@ -602,7 +612,7 @@ flowchart LR
     end
 
     subgraph tier2 [Tier 2: Primary]
-        T2_In["Raw Text"] --> RoBERTa["RoBERTa<br/>Fine-Tuned"] --> Head2["Linear Head"]
+        T2_In["Raw Text"] --> RoBERTa["DistilRoBERTa<br/>Fine-Tuned"] --> Head2["Linear Head"]
     end
 
     subgraph tier3 [Tier 3: Advanced]
@@ -616,7 +626,7 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    Start["Load Pretrained<br/>roberta-base"] --> Init["Initialize Classification Head"]
+    Start["Load Pretrained<br/>distilroberta-base"] --> Init["Initialize Classification Head"]
     Init --> Loop["Training Loop"]
     
     subgraph epoch [Per Epoch]
@@ -681,11 +691,13 @@ python -m src.data_preprocessing
 
 Options:
 
-| Flag | Description |
-| --- | --- |
+
+| Flag               | Description                              |
+| ------------------ | ---------------------------------------- |
 | `--subset finance` | Process a single domain instead of `all` |
-| `--skip_download` | Reuse previously downloaded raw data |
-| `--seed 42` | Random seed for splitting (default: 42) |
+| `--skip_download`  | Reuse previously downloaded raw data     |
+| `--seed 42`        | Random seed for splitting (default: 42)  |
+
 
 ### 10.4 Step 2 — Train the Models
 
@@ -709,15 +721,17 @@ This fine-tunes `distilroberta-base` using the HuggingFace `Trainer` with early 
 python -m src.train --tier 2 --lr 3e-5 --epochs 3 --batch_size 16
 ```
 
-| Default Hyperparameter | Value |
-| --- | --- |
-| Model | `distilroberta-base` |
-| Learning rate | 2e-5 |
-| Batch size | 16 (effective 64 via gradient accumulation) |
-| Gradient accumulation steps | 4 |
-| Max sequence length | 512 |
-| Epochs | 5 (with early stopping patience = 2) |
-| FP16 | Disabled (no Tensor Cores on Tesla P4) |
+
+| Default Hyperparameter      | Value                                       |
+| --------------------------- | ------------------------------------------- |
+| Model                       | `distilroberta-base`                        |
+| Learning rate               | 2e-5                                        |
+| Batch size                  | 16 (effective 64 via gradient accumulation) |
+| Gradient accumulation steps | 4                                           |
+| Max sequence length         | 512                                         |
+| Epochs                      | 5 (with early stopping patience = 2)        |
+| FP16                        | Disabled (no Tensor Cores on Tesla P4)      |
+
 
 The best checkpoint is saved to `models/roberta-hc3-best/`.
 
@@ -743,22 +757,26 @@ python -m src.evaluate --tier 2 --model_path models/roberta-hc3-best
 
 Evaluation outputs are written to `results/`:
 
-| File | Description |
-| --- | --- |
-| `roberta_metrics.json` | Accuracy, precision, recall, F1, ROC-AUC |
-| `roberta_confusion.png` | Confusion matrix heatmap |
-| `roberta_roc.png` | ROC curve plot |
-| `roberta_per_domain.csv` | Per-domain metric breakdown |
+
+| File                     | Description                              |
+| ------------------------ | ---------------------------------------- |
+| `roberta_metrics.json`   | Accuracy, precision, recall, F1, ROC-AUC |
+| `roberta_confusion.png`  | Confusion matrix heatmap                 |
+| `roberta_roc.png`        | ROC curve plot                           |
+| `roberta_per_domain.csv` | Per-domain metric breakdown              |
+
 
 ### 10.6 Our Results (Tier 2 — DistilRoBERTa)
 
-| Metric | Score |
-| --- | --- |
-| Accuracy | 99.83% |
+
+| Metric    | Score  |
+| --------- | ------ |
+| Accuracy  | 99.83% |
 | Precision | 99.51% |
-| Recall | 99.95% |
-| F1 | 99.73% |
-| ROC-AUC | 99.99% |
+| Recall    | 99.95% |
+| F1        | 99.73% |
+| ROC-AUC   | 99.99% |
+
 
 ### 10.7 Loading the Pre-trained Model
 
