@@ -17,7 +17,8 @@
 7. [Project Directory Structure](#7-project-directory-structure)
 8. [Dependencies](#8-dependencies)
 9. [Architecture Diagrams](#9-architecture-diagrams)
-10. [References](#10-references)
+10. [How to Reproduce](#10-how-to-reproduce)
+11. [References](#11-references)
 
 ---
 
@@ -638,7 +639,156 @@ flowchart TB
 
 ---
 
-## 10. References
+## 10. How to Reproduce
+
+### 10.1 Prerequisites
+
+- Python 3.10+
+- (Optional) NVIDIA GPU with CUDA support for Tier 2 training
+
+> **GPU note**: This project was developed and tested on an NVIDIA Tesla P4 (compute capability 6.1, CUDA 11.8). If your GPU has a different architecture, the default PyTorch install (`pip install torch`) should work. If you encounter CUDA kernel errors, install a build matching your CUDA version — see [PyTorch's install page](https://pytorch.org/get-started/locally/).
+
+### 10.2 Setup
+
+```bash
+# Clone the repository
+git clone https://github.com/Max00358/AI-gen-text-detector.git
+cd AI-gen-text-detector
+
+# Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate        # bash / zsh
+# source .venv/bin/activate.csh  # tcsh / csh
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+If you are on a machine with a CUDA 11.8 GPU (e.g. Tesla P4, GTX 1080), install the matching PyTorch build **before** the other dependencies:
+
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt
+```
+
+### 10.3 Step 1 — Download and Preprocess the Dataset
+
+This downloads the HC3 `all.jsonl` from HuggingFace, flattens the multi-answer rows into individual (text, label) samples, and creates stratified train/val/test CSV splits under `data/processed/`.
+
+```bash
+python -m src.data_preprocessing
+```
+
+Options:
+
+| Flag | Description |
+| --- | --- |
+| `--subset finance` | Process a single domain instead of `all` |
+| `--skip_download` | Reuse previously downloaded raw data |
+| `--seed 42` | Random seed for splitting (default: 42) |
+
+### 10.4 Step 2 — Train the Models
+
+**Tier 1: TF-IDF + Logistic Regression baseline**
+
+```bash
+python -m src.train --tier 1 --classifier lr
+```
+
+Replace `lr` with `svm` to train a Linear SVM instead.
+
+**Tier 2: Fine-tuned DistilRoBERTa**
+
+```bash
+python -m src.train --tier 2
+```
+
+This fine-tunes `distilroberta-base` using the HuggingFace `Trainer` with early stopping. Training hyperparameters (learning rate, batch size, epochs, etc.) are defined in `src/utils.py::TrainConfig` and can be overridden via CLI flags:
+
+```bash
+python -m src.train --tier 2 --lr 3e-5 --epochs 3 --batch_size 16
+```
+
+| Default Hyperparameter | Value |
+| --- | --- |
+| Model | `distilroberta-base` |
+| Learning rate | 2e-5 |
+| Batch size | 16 (effective 64 via gradient accumulation) |
+| Gradient accumulation steps | 4 |
+| Max sequence length | 512 |
+| Epochs | 5 (with early stopping patience = 2) |
+| FP16 | Disabled (no Tensor Cores on Tesla P4) |
+
+The best checkpoint is saved to `models/roberta-hc3-best/`.
+
+### 10.5 Step 3 — Evaluate
+
+**Tier 1:**
+
+```bash
+python -m src.evaluate --tier 1 --classifier lr
+```
+
+**Tier 2:**
+
+```bash
+python -m src.evaluate --tier 2
+```
+
+To evaluate a checkpoint at a custom path:
+
+```bash
+python -m src.evaluate --tier 2 --model_path models/roberta-hc3-best
+```
+
+Evaluation outputs are written to `results/`:
+
+| File | Description |
+| --- | --- |
+| `roberta_metrics.json` | Accuracy, precision, recall, F1, ROC-AUC |
+| `roberta_confusion.png` | Confusion matrix heatmap |
+| `roberta_roc.png` | ROC curve plot |
+| `roberta_per_domain.csv` | Per-domain metric breakdown |
+
+### 10.6 Our Results (Tier 2 — DistilRoBERTa)
+
+| Metric | Score |
+| --- | --- |
+| Accuracy | 99.83% |
+| Precision | 99.51% |
+| Recall | 99.95% |
+| F1 | 99.73% |
+| ROC-AUC | 99.99% |
+
+### 10.7 Loading the Pre-trained Model
+
+The trained model weights are hosted on HuggingFace Hub (too large for GitHub). To load them directly:
+
+```python
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("AyoMax00358/ai-text-detector")
+model = AutoModelForSequenceClassification.from_pretrained("AyoMax00358/ai-text-detector")
+```
+
+To run inference on a text sample:
+
+```python
+import torch
+
+text = "The economy is influenced by many factors including monetary policy..."
+inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+
+with torch.no_grad():
+    logits = model(**inputs).logits
+
+pred = logits.argmax(dim=-1).item()
+print("AI-generated" if pred == 1 else "Human-written")
+```
+
+---
+
+## 11. References
 
 1. Guo, B., Zhang, X., Wang, Z., Jiang, M., Nie, J., Ding, Y., Yue, J., & Wu, Y. (2023). *How Close is ChatGPT to Human Experts? Comparison Corpus, Evaluation, and Detection*. [arXiv:2301.07597](https://arxiv.org/abs/2301.07597)
 2. Liu, Y., Ott, M., Goyal, N., et al. (2019). *RoBERTa: A Robustly Optimized BERT Pretraining Approach*. [arXiv:1907.11692](https://arxiv.org/abs/1907.11692)
